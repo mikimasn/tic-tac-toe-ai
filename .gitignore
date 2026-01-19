@@ -1,0 +1,6 @@
+*.pth
+venv/
+.idea/
+__pycache__/
+.vscode/
+*.txt
