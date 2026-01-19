@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 import torch.nn.functional as F
-from copy import deepcopy
+import numpy as np
 gameStateType = TypeVar("gameStateType")
 gameMoveType = TypeVar("gameMoveType")
 @dataclass
@@ -136,32 +136,33 @@ class MCTS(ABC, Generic[gameStateType, gameMoveType]):
 class GameState():
     crossNowPlaying:bool
     nowallowed:int
-    board:list[int]
-    wins:list[int]
+    board:np.ndarray
+    wins:np.ndarray
     finished:bool
     def embed_board(self) -> torch.Tensor:
-        Cpos: list[list[float]]; Opos: list[list[float]]
+        Cpos: list[list[float]]
+        Opos: list[list[float]]
         Cpos, Opos = [[0 for _ in range(9)] for _ in range(9)], [[0 for _ in range(9)] for _ in range(9)]
         currenttoplay = 1 if self.crossNowPlaying else 2
         for idx, ele in enumerate(self.board):
-            subboard, int_index = idx//9, idx%9
-            rx, ry, sx, sy = subboard%3, subboard//3, int_index%3, int_index//3
-            rx, ry = rx*3, ry*3
+            subboard, int_index = idx // 9, idx % 9
+            rx, ry, sx, sy = subboard % 3, subboard // 3, int_index % 3, int_index // 3
+            rx, ry = rx * 3, ry * 3
             if ele == currenttoplay:
-                Cpos[ry+sy][rx+sx]=1
+                Cpos[ry + sy][rx + sx] = 1
             elif not ele == 0:
-                Opos[ry+sy][rx+sx]=1
-        moveMask: list[list[float]] = [[0 if not self.nowallowed < 0 else 1 for _ in range(9) ] for _ in range(9)]
+                Opos[ry + sy][rx + sx] = 1
+        moveMask: list[list[float]] = [[0 if not self.nowallowed < 0 else 1 for _ in range(9)] for _ in range(9)]
         if self.nowallowed >= 0:
-            rx, ry = self.nowallowed%3, self.nowallowed//3
-            rx, ry = rx*3, ry*3
+            rx, ry = self.nowallowed % 3, self.nowallowed // 3
+            rx, ry = rx * 3, ry * 3
             for x in range(3):
                 for y in range(3):
-                    moveMask[ry+y][rx+x]=1
+                    moveMask[ry + y][rx + x] = 1
         for x in range(9):
             for y in range(9):
-                if Cpos[x][y] != 0 or Opos[x][y]!=0:
-                    moveMask[x][y]=0
+                if Cpos[x][y] != 0 or Opos[x][y] != 0:
+                    moveMask[x][y] = 0
         return torch.Tensor([Cpos, Opos, moveMask])
     
     def visualize_board(self):
@@ -246,10 +247,10 @@ class MCTSTickTacToe(MCTSForestParticipant[GameState, tuple[int,int]]):
         self.currentNode: list[int] = []
         self._forest_identifier: int|None = None
         if start_state is None:
-            start_state = GameState(True,-1,[0 for _ in range(81)],[-2 for _ in range(9)], False)
+            start_state = GameState(True,-1,np.zeros(81,dtype=np.int8),np.full(9,-2), False)
         super().__init__(start_state=start_state,history_size=history_size, cpuct=cpuct,training_mode=training_mode)
     def _apply_move(self, gameState: GameState, move: tuple[int,int]) -> GameState:
-        gameState = deepcopy(gameState)
+        gameState = GameState(not gameState.crossNowPlaying, gameState.nowallowed, gameState.board.copy(), gameState.wins.copy(),gameState.finished)
         assert gameState.board[move[0]*9 + move[1]] == 0
         gameState.board[move[0]*9 + move[1]] = 1 if gameState.crossNowPlaying else 2
         gameState.crossNowPlaying = not gameState.crossNowPlaying
@@ -262,13 +263,15 @@ class MCTSTickTacToe(MCTSForestParticipant[GameState, tuple[int,int]]):
             if a1==1: return 1
             if a1==2: return -1
         return 0
-    def _score_game(self, winsBoard:list[int]) -> int:
-        res = self._score_subboard([ele if not ele == -2 else 0 for ele in winsBoard])
+    def _score_game(self, winsBoard:np.ndarray) -> int:
+        score = winsBoard.copy()
+        score[score==-2] = 0
+        res = self._score_subboard(score)
         if not res == -2:
             return res
         return -2 if min(winsBoard) == -2 else 0
     #returns -2 if game is unfinished, -1 if O is victorius, 0 for draw, and 1 if X is victorius
-    def _score_subboard(self,board: list[int]):
+    def _score_subboard(self,board: np.ndarray):
         for i in range(3):
             r = self._score_line(board[i],board[i+1],board[i+2])
             if not r == 0:
@@ -288,10 +291,10 @@ class MCTSTickTacToe(MCTSForestParticipant[GameState, tuple[int,int]]):
                 return -2
         return 0
     def _hash_position(self, gamestate: GameState) -> int:
-        hash = 0
+        hash = int(0)
         for v in gamestate.board:
             hash*=3
-            hash+=v
+            hash+=int(v)
         hash *= 10
         hash += gamestate.nowallowed+1
         return hash
