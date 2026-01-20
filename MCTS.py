@@ -153,7 +153,7 @@ class GameState():
     finished: bool
 
     def embed_board(self) -> torch.Tensor:
-        Cpos: list[list[float]];
+        Cpos: list[list[float]]
         Opos: list[list[float]]
         Cpos, Opos = [[0 for _ in range(9)] for _ in range(9)], [[0 for _ in range(9)] for _ in range(9)]
         currenttoplay = 1 if self.crossNowPlaying else 2
@@ -225,7 +225,7 @@ class MCTSForest(Generic[gameStateType, gameMoveType]):
     def resolve_queue(self):
         if len(self.evalqueue) == 0:
             return
-        with torch.no_grad():
+        with torch.inference_mode():
             prob, v = self.model(torch.stack([tensor for _, tensor, _ in self.evalqueue]).to(self.device))
         for idx, (gameid, input, internal_id) in enumerate(self.evalqueue):
             self.games[gameid].postevaluate(input, prob[idx], v[idx], internal_id)
@@ -362,7 +362,7 @@ class MCTSTickTacToe(MCTSForestParticipant[GameState, int]):
             prop: torch.Tensor
             v: torch.Tensor
             embeded = currentNode.gameState.embed_board()
-            with torch.no_grad():
+            with torch.inference_mode():
                 prop, v = self.model(embeded.unsqueeze(0).to(self.device))
             self.postevaluate(embeded, prop.reshape(81), v[0], len(self.currentNode) - 1)
         else:
@@ -374,10 +374,10 @@ class MCTSTickTacToe(MCTSForestParticipant[GameState, int]):
         value = v.item()
         movemask = input[2].reshape(81)
         currentNode.eval = value
-        currentNode.possibleMovesPropabilityDist = F.softmax(torch.Tensor(prop[movemask==1]),
+        currentNode.possibleMovesPropabilityDist = F.softmax(prop[movemask==1],
                                                              dim=0).cpu().numpy().tolist()
         self._backprop(self.pathSave[id], value)
-        self.pathSave.pop(id);
+        self.pathSave.pop(id)
         self.currentNode.pop(id)
 
     def is_finished(self) -> bool:
