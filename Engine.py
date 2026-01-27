@@ -488,9 +488,9 @@ class Tournament():
                 forest2.execute_iterations(mctsiters)
             for idx in range(num_games):
                 if normal:
-                    selected = forest1.select_in_game(idx, 1 if counter < 10 else 0)
+                    selected = forest1.select_in_game(idx, 0.5 if counter < 10 else 0)
                 else:
-                    selected = forest2.select_in_game(idx, 1 if counter < 10 else 0)
+                    selected = forest2.select_in_game(idx, 0.5 if counter < 10 else 0)
                 if selected is not None:
                     forest1.make_game_move(idx, selected)
                     forest2.make_game_move(idx, selected)
