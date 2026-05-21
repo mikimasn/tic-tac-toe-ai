@@ -1,3 +1,4 @@
+import random
 from abc import ABC, abstractmethod
 from typing import Generic, TypeVar
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ import torch.nn.functional as F
 import numpy as np
 import math
 from torch.distributions.dirichlet import Dirichlet
+from numba import njit
 
 gameStateType = TypeVar("gameStateType")
 gameMoveType = TypeVar("gameMoveType")
@@ -116,9 +118,8 @@ class MCTS(ABC, Generic[gameStateType, gameMoveType]):
             self.evaluate(newPositionHash, path_from_root)
             return newPositionHash
         newNode = MCTSNode(1, 0, newPositon, self.get_possible_moves(newPositon), [], [], [], [], depth)
-        newNode.possibleMovesHash, newNode.possibleMovesVisitCount, newNode.possibleMovesEvalSum = [-1 for _ in
-                                                                                                    newNode.possibleMoves], [
-            0 for _ in newNode.possibleMoves], [0 for _ in newNode.possibleMoves]
+        num_moves = len(newNode.possibleMoves)
+        newNode.possibleMovesHash, newNode.possibleMovesVisitCount, newNode.possibleMovesEvalSum = [-1] * num_moves, [0]*num_moves, [0]*num_moves
         self.transpositionTable[newPositionHash] = newNode
         self.evaluate(newPositionHash, path_from_root)
         return newPositionHash
@@ -162,6 +163,30 @@ class MCTS(ABC, Generic[gameStateType, gameMoveType]):
     def get_training_data(self) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         pass
 
+@njit
+def jit_embed_board(board: np.ndarray, wins: np.ndarray, nowallowed:int, crossNowPlaying: bool) -> np.ndarray:
+    embeded = np.zeros((3,9,9), dtype=np.float32)
+    currenttoplay = 1 if crossNowPlaying else 2
+    for idx, ele in enumerate(board):
+        if ele == currenttoplay:
+            embeded[0,idx // 9,idx % 9] = 1
+        elif not ele == 0:
+            embeded[1,idx // 9,idx % 9] = 1
+    if nowallowed >= 0:
+        rx, ry = nowallowed % 3, nowallowed // 3
+        rx, ry = rx * 3, ry * 3
+        for x in range(3):
+            for y in range(3):
+                relpos = (ry + y) * 9 + rx + x
+                if board[relpos] == 0:
+                    embeded[2,ry + y,rx + x] = 1
+    else:
+        for idx in range(81):
+            if board[idx] == 0:
+                subboard = (idx // 27) * 3 + (idx % 9) // 3
+                if wins[subboard] == -2:
+                    embeded[2,idx // 9,idx % 9] = 1
+    return embeded
 
 @dataclass
 class GameState():
@@ -172,35 +197,19 @@ class GameState():
     finished: bool
 
     def embed_board(self) -> torch.Tensor:
-        Cpos: list[list[float]]
-        Opos: list[list[float]]
-        Cpos, Opos = [[0 for _ in range(9)] for _ in range(9)], [[0 for _ in range(9)] for _ in range(9)]
-        currenttoplay = 1 if self.crossNowPlaying else 2
-        for idx, ele in enumerate(self.board):
-            if ele == currenttoplay:
-                Cpos[idx // 9][idx % 9] = 1
-            elif not ele == 0:
-                Opos[idx // 9][idx % 9] = 1
-        moveMask: list[list[float]] = [[0 if not self.nowallowed < 0 else 1 for _ in range(9)] for _ in range(9)]
-        if self.nowallowed >= 0:
-            rx, ry = self.nowallowed % 3, self.nowallowed // 3
-            rx, ry = rx * 3, ry * 3
-            for x in range(3):
-                for y in range(3):
-                    moveMask[ry + y][rx + x] = 1
-        for x in range(9):
-            for y in range(9):
-                if Cpos[x][y] != 0 or Opos[x][y] != 0:
-                    moveMask[x][y] = 0
-        return torch.Tensor([Cpos, Opos, moveMask])
+        result = jit_embed_board(self.board, self.wins, self.nowallowed, self.crossNowPlaying)
+        return torch.from_numpy(result)
 
     def visualize_board(self):
         symbols = {0: '.', 1: 'X', 2: 'O'}
+        embeded = self.embed_board()
         for y in range(9):
             row = ""
             for x in range(9):
                 idx = y*9 + x
-                row += symbols[self.board[idx]] + " "
+                row += (symbols[self.board[idx]] if self.board[idx]!=0 else ('A' if embeded[2][y][x]==1 else symbols[0])) + " "
+                assert self.board[idx]==0 or not embeded[2][y][x]==1, "Field is both avaliable and used"
+                assert embeded[2][y][x] == 0 or self.wins[(y//3) * 3 + (x//3)] == -2, "Field avaliable when subboard solved"
                 if x % 3 == 2 and x != 8:
                     row += "| "
             print(row)
@@ -258,13 +267,17 @@ class MCTSForest(Generic[gameStateType, gameMoveType]):
             return
         self.old_prob, self.old_v = self.prob.detach().cpu(), self.v.detach().cpu()
         with torch.inference_mode():
-            self.prob, self.v = self.model(torch.stack([tensor for _, tensor, _ in self.evalqueue]).to(self.device))
+            toexecute = torch.stack([tensor for _, tensor, _ in self.evalqueue])
+            if len(toexecute)<len(self.games):
+                toexecute = torch.cat([toexecute,torch.zeros((len(self.games)-len(toexecute),3,9,9))],dim=0)
+            self.prob, self.v = self.model(toexecute.to(self.device))
+            self.prob, self.v = self.prob.clone(), self.v.clone()
         self.resolve_queue()
         self.respondqueue = self.evalqueue
         self.evalqueue = []
     def resolve_queue(self):
         if self.old_prob is None:
-            self.old_prob, self.old_v = self.prob.detach().cpu(), self.v.detach().cpu()
+            self.old_prob, self.old_v = self.prob.clone().detach().cpu(), self.v.clone().detach().cpu()
         for idx, (gameid, input, internal_id) in enumerate(self.respondqueue):
             self.games[gameid].postevaluate(input, self.old_prob[idx], self.old_v[idx], internal_id)
         self.respondqueue.clear()
@@ -312,7 +325,75 @@ class MCTSForest(Generic[gameStateType, gameMoveType]):
         self.games[idx].step(move)
         self.check_finish_status(idx)
 
+@njit(cache=True)
+def _score_line(a1: int, a2: int, a3: int) -> int:
+    if a1 == a2 and a2 == a3:
+        if a1 == 1: return 1
+        if a1 == 2 or a1 == -1: return -1
+    return 0
 
+@njit(cache=True)
+def jit_score_subboard(board: np.ndarray) -> int:
+    for i in range(0, 7, 3):
+        r = _score_line(board[i], board[i + 1], board[i + 2])
+        if not r == 0:
+            return r
+    for i in range(3):
+        r = _score_line(board[i], board[i + 3], board[i + 6])
+        if not r == 0:
+            return r
+    r = _score_line(board[0], board[4], board[8])
+    if not r == 0:
+        return r
+    r = _score_line(board[2], board[4], board[6])
+    if not r == 0:
+        return r
+    for i in board:
+        if i == 0:
+            return -2
+    return 0
+
+@njit(cache=True)
+def jit_score_game(wins_board: np.ndarray) -> int:
+    temp_board = np.zeros(9, dtype=np.int8)
+    has_minus_two = False
+
+    for i in range(9):
+        val = wins_board[i]
+        if val == -2:
+            temp_board[i] = 0
+            has_minus_two = True
+        else:
+            temp_board[i] = val
+
+    res = jit_score_subboard(temp_board)
+    if res != -2:
+        return res
+    if has_minus_two:
+        return -2
+    return 0
+
+
+@njit
+def jit_get_possible_moves(nowallowed:int, wins: np.ndarray, board:np.ndarray) -> np.ndarray:
+    moves = np.empty(81, dtype=np.int32)
+    count = 0
+    if nowallowed >= 0 and wins[nowallowed] == -2:
+        bx = (nowallowed % 3) * 3
+        by = (nowallowed // 3) * 3
+        for i in range(3):
+            for j in range(3):
+                idx = (by + i) * 9 + bx + j
+                if board[idx] == 0:
+                    moves[count]=(by + i) * 9 + bx + j
+                    count+=1
+    else:
+        for i in range(9 * 9):
+            subboard_id = (i // 27) * 3 + (i%9) // 3
+            if board[i] == 0 and wins[subboard_id] == -2:
+                moves[count]=i
+                count+=1
+    return moves[:count]
 class MCTSTickTacToe(MCTSForestParticipant[GameState, int]):
     def __init__(self, model: nn.Module, device: torch.device, forest: MCTSForest[GameState, int] | None = None,
                  start_state: GameState | None = None, history_size: int = 1, cpuct: float = 1,
@@ -343,62 +424,21 @@ class MCTSTickTacToe(MCTSForestParticipant[GameState, int]):
         gameState.finished = self._score_game(gameState.wins) > -2
         return gameState
 
-    def _score_line(self, a1: int, a2: int, a3: int):
-        if a1 == a2 and a2 == a3:
-            if a1 == 1: return 1
-            if a1 == 2 or a1 == -1: return -1
-        return 0
-
     def _score_game(self, winsBoard: np.ndarray) -> int:
-        score = winsBoard.copy()
-        score[score == -2] = 0
-
-        res = self._score_subboard(score)
-        if not res == -2:
-            return res
-        return -2 if min(winsBoard) == -2 else 0
+        return jit_score_game(winsBoard)
 
     # returns -2 if game is unfinished, -1 if O is victorius, 0 for draw, and 1 if X is victorius
     def _score_subboard(self, board: np.ndarray):
-        for i in range(0,7,3):
-            r = self._score_line(board[i], board[i + 1], board[i + 2])
-            if not r == 0:
-                return r
-        for i in range(3):
-            r = self._score_line(board[i], board[i + 3], board[i + 6])
-            if not r == 0:
-                return r
-        r = self._score_line(board[0], board[4], board[8])
-        if not r == 0:
-            return r
-        r = self._score_line(board[2], board[4], board[6])
-        if not r == 0:
-            return r
-        for i in board:
-            if i == 0:
-                return -2
-        return 0
+        return jit_score_subboard(board)
 
     def _hash_position(self, gamestate: GameState) -> int:
-        hash = int(0)
-        for v in gamestate.board:
-            hash *= 3
-            hash += int(v)
-        hash *= 10
-        hash += gamestate.nowallowed + 1
-        return hash
+        return hash((gamestate.board.tobytes(), gamestate.nowallowed))
 
     def get_possible_moves(self, gameState: GameState) -> list[int]:
         moveset: list[int] = []
         if gameState.finished:
             return moveset
-        if gameState.nowallowed >= 0 and gameState.wins[gameState.nowallowed] == -2:
-            bx, by = gameState.nowallowed % 3 * 3, (gameState.nowallowed // 3) * 3
-            moveset = [(by + i) * 9 + bx + j for i in range(3) for j in range(3) if
-                       gameState.board[(by + i) * 9 + bx + j] == 0]
-        else:
-            moveset = [i for i in range(9 * 9) if gameState.board[i] == 0]
-        return moveset
+        return jit_get_possible_moves(gameState.nowallowed, gameState.wins, gameState.board).tolist()
 
     def evaluate(self, node: int, path_from_root: list[tuple[int, int]]):
         currentNode = self.transpositionTable[node]
@@ -474,7 +514,7 @@ class Tournament():
         forest1, forest2 = forests
         for _ in range(num_games):
             forest1.add_game(MCTSTickTacToe(self.model1, self.device, forest1))
-            forest2.add_game(MCTSTickTacToe(self.model1, self.device, forest2))
+            forest2.add_game(MCTSTickTacToe(self.model2, self.device, forest2))
         if start_moves is not None:
             for f in range(start_moves.shape[0]):
                 for idx in range(num_games):

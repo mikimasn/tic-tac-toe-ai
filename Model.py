@@ -39,11 +39,11 @@ class PolicyNet(nn.Module):
         )
 
         self.value_head = nn.Sequential(
-            nn.Conv2d(channels, 1, kernel_size=1, bias=False),
+            nn.Conv2d(channels, 1, kernel_size=1, bias=False), 
             nn.BatchNorm2d(1),
             nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(9 * 9, 64),
+            nn.Flatten(), 
+            nn.Linear(81, 64), 
             nn.ReLU(),
             nn.Linear(64, 1),
             nn.Tanh()
@@ -61,5 +61,4 @@ class PolicyNet(nn.Module):
 
         policy_logits = self.policy_head(x)
         value = self.value_head(x)
-
         return policy_logits, value

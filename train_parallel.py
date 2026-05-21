@@ -15,12 +15,13 @@ from Model import PolicyNet
 
 BUFFER_SIZE = 500000
 BATCH_SIZE = 1024
-NUM_PRODUCERS = 12
-NUM_ITERS = 1000
-GAMES_PER_PRODUCER = 32
+NUM_PRODUCERS = 4
+NUM_ITERS = 200
+GAMES_PER_PRODUCER = 128
 TOUNAMENT_GAMES = 15
 REPETITION_FACTOR = 1
-SAVE_PATH = "checkpoint10/"
+SAVE_PATH = "checkpoint13/"
+LOAD_FROM_CHECKPOINT = None
 if torch.cuda.is_available():
     DEVICE = torch.device('cuda')
 else:
@@ -36,7 +37,6 @@ class SharedReplayBuffer:
         self.size = mp.Value('i', 0)
         manager = mp.Manager()
         self.lock = mp.Lock()
-        self.best_dict = manager.dict()
         self.model_lock = mp.Lock()
         self.model = model.share_memory()
         self.training_iters = mp.Value('i', 0)
@@ -74,15 +74,6 @@ class SharedReplayBuffer:
     def get_best_model_ver(self):
         with self.model_lock:
             return self.version.value
-    def best_model(self):
-        with self.model_lock:
-            return {k: v.clone() for k, v in self.best_dict.items()}
-    def replace_best_model(self, model:nn.Module):
-        with self.model_lock:
-            self.best_dict.clear()
-            for k,v in model.state_dict().items():
-                self.best_dict[k] = v
-            self.version.value += 1
     def bump_iter(self):
         with self.lock:
             self.training_iters.value += 1
@@ -99,10 +90,49 @@ class SharedReplayBuffer:
             self.data_tensor.copy_(torch.roll(self.data_tensor, -amount, dims=0))
             self.prop_tensor.copy_(torch.roll(self.prop_tensor, -amount, dims=0))
             self.target_tensor.copy_(torch.roll(self.target_tensor, -amount, dims=0))
+    def add_batch(self, data_list: list[torch.Tensor], target_list: list[torch.Tensor], prop_list: list[torch.Tensor]):
+        amount = len(data_list)
+        if amount == 0:
+            return
+
+        data_batch = torch.stack(data_list)
+        prop_batch = torch.stack(prop_list)
+
+        target_batch = torch.stack(target_list).view(amount, 1).float()
+
+        with self.lock:
+            if amount > self.capacity:
+                data_batch = data_batch[-self.capacity:]
+                prop_batch = prop_batch[-self.capacity:]
+                target_batch = target_batch[-self.capacity:]
+                amount = self.capacity
+
+            start_idx = self.pos.value
+            end_idx = start_idx + amount
+
+            if end_idx <= self.capacity:
+                self.data_tensor[start_idx:end_idx] = data_batch
+                self.target_tensor[start_idx:end_idx] = target_batch
+                self.prop_tensor[start_idx:end_idx] = prop_batch
+            else:
+                part1_size = self.capacity - start_idx
+                part2_size = amount - part1_size
+
+                self.data_tensor[start_idx:self.capacity] = data_batch[:part1_size]
+                self.target_tensor[start_idx:self.capacity] = target_batch[:part1_size]
+                self.prop_tensor[start_idx:self.capacity] = prop_batch[:part1_size]
+
+                self.data_tensor[:part2_size] = data_batch[part1_size:]
+                self.target_tensor[:part2_size] = target_batch[part1_size:]
+                self.prop_tensor[:part2_size] = prop_batch[part1_size:]
+
+            self.pos.value = end_idx % self.capacity
+            self.size.value = min(self.capacity, self.size.value + amount)
     def __len__(self):
         with self.lock:
             return self.size.value
 def producer_process(rank, buffer: SharedReplayBuffer, stop_event):
+    torch.set_float32_matmul_precision('high')
     pid = os.getpid()
     print(f"Producer {rank} (PID: {pid}) started.")
     random.seed(rank)
@@ -111,7 +141,7 @@ def producer_process(rank, buffer: SharedReplayBuffer, stop_event):
     global_counter = 0
 
     while not stop_event.is_set():
-        compiled_model = torch.jit.trace(buffer.get_model_copy().to(DEVICE), torch.zeros((1, 3, 9, 9)).to(DEVICE))
+        compiled_model = torch.compile(buffer.get_model_copy().to(DEVICE), mode="max-autotune")
         compiled_model.eval()
         forest = MCTSForest(compiled_model,DEVICE,shards=2)
         training_temp = 2
@@ -132,24 +162,44 @@ def producer_process(rank, buffer: SharedReplayBuffer, stop_event):
             print(f"Producer {rank} executed move {local_counter}")
             local_counter += 1
         commited = 0
+        data_list, target_list, prop_list = [], [], []
         for game in forest.games:
             samples = game.get_training_data()
             for sample in samples:
-                buffer.add(sample[0], sample[2], sample[1])
-                commited += 1
+                board, pi, value = sample[0], sample[1], sample[2]
+
+                for k in range(4):
+                    b_rot = torch.rot90(board, k, dims=[1, 2])
+                    p_rot = torch.rot90(pi, k, dims=[0, 1])
+                    data_list.append(b_rot)
+                    target_list.append(value)
+                    prop_list.append(p_rot)
+
+                    b_flip = torch.flip(b_rot, dims=[2])
+                    p_flip = torch.flip(p_rot, dims=[1])
+                    data_list.append(b_flip)
+                    target_list.append(value)
+                    prop_list.append(p_flip)
+        buffer.add_batch(data_list, target_list, prop_list)
+        commited += len(data_list)
         print(f"Producer {rank} comitted new games({commited} new moves)")
         buffer.increase_prodcuers()
         global_counter += 1
 
 
 
-def consumer_process(buffer:SharedReplayBuffer, stop_event):
+def consumer_process(buffer:SharedReplayBuffer, stop_event, load_path):
+    torch.set_float32_matmul_precision('high')
     print("Learner started.")
     model = buffer.model
-
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-3)
     step = 0
-    best_model = PolicyNet(num_blocks=8)
+    best_model = PolicyNet(num_blocks=8).to(DEVICE)
+    if load_path is not None:
+        load_dict = torch.load(load_path)
+        best_model.load_state_dict(load_dict["model"])
+        optimizer.load_state_dict(load_dict["optimizer"])
+        step = load_dict["step"]
     while not stop_event.is_set():
         value_loss_sum, policy_loss_sum = 0, 0
         num = buffer.commited_producers()
@@ -164,6 +214,7 @@ def consumer_process(buffer:SharedReplayBuffer, stop_event):
         model.eval()
         for i in range(0,num_of_samples,BATCH_SIZE):
             data, target, prop_target = buffer.get_data(i,BATCH_SIZE)
+            data, target, prop_target = data.to(DEVICE), target.to(DEVICE), prop_target.to(DEVICE)
             counter+=1
             with torch.no_grad():
                 p, v = model(data)
@@ -180,6 +231,7 @@ def consumer_process(buffer:SharedReplayBuffer, stop_event):
         counter = 0
         for i in range((num_of_samples//BATCH_SIZE) * REPETITION_FACTOR):
             data, target, prop_target = buffer.sample(BATCH_SIZE)
+            data, target, prop_target = data.to(DEVICE), target.to(DEVICE), prop_target.to(DEVICE)
             counter+=1
             optimizer.zero_grad()
             p, v = model(data)
@@ -198,15 +250,16 @@ def consumer_process(buffer:SharedReplayBuffer, stop_event):
         print(f"[Learner] Step {step} | Value Loss: {value_loss_sum / counter} | Policy Loss: {policy_loss_sum / counter} | Buffer Size: {buffer.size.value}")
         buffer.clear(amount=num_of_samples)
         buffer.bump_iter()
-        checkpoint = {
-                'step': step,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict()
-        }
-        torch.save(checkpoint, f"{SAVE_PATH}step_{step}.pt")
-        if step%10 == 0:
-            oldmodel_traced = torch.jit.trace(best_model.to(DEVICE), torch.randn(1,3,9,9).to(DEVICE))
-            newmodel_traced = torch.jit.trace(deepcopy(model).to(DEVICE), torch.randn(1,3,9,9).to(DEVICE))
+        if step%20==0:
+            checkpoint = {
+                    'step': step,
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict()
+            }
+            torch.save(checkpoint, f"{SAVE_PATH}step_{step}.pt")
+        if step%40 == 0:
+            oldmodel_traced = torch.compile(best_model.to(DEVICE), mode="max-autotune")
+            newmodel_traced = torch.compile(deepcopy(model).to(DEVICE), mode="max-autotune")
             newmodel_traced.eval()
             oldmodel_traced.eval()
             tournament = Tournament(newmodel_traced,oldmodel_traced,DEVICE)
@@ -219,13 +272,18 @@ def consumer_process(buffer:SharedReplayBuffer, stop_event):
 
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
-    model = PolicyNet(num_blocks=8)
+    torch.set_float32_matmul_precision('high')
+    model = PolicyNet(num_blocks=8).to(DEVICE)
+    if LOAD_FROM_CHECKPOINT is not None:
+        model.load_state_dict(torch.load(LOAD_FROM_CHECKPOINT)["model"])
     shared_buffer = SharedReplayBuffer(BUFFER_SIZE,model)
+    if LOAD_FROM_CHECKPOINT is not None:
+        shared_buffer.training_iters.value = torch.load(LOAD_FROM_CHECKPOINT)["step"]
     stop_event = mp.Event()
 
     processes = []
 
-    p_learner = mp.Process(target=consumer_process, args=(shared_buffer, stop_event))
+    p_learner = mp.Process(target=consumer_process, args=(shared_buffer, stop_event, LOAD_FROM_CHECKPOINT))
     p_learner.start()
     processes.append(p_learner)
 
@@ -240,13 +298,6 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("Stopping...")
     finally:
-        data = {
-            "games": shared_buffer.data_tensor,
-            "values": shared_buffer.target_tensor,
-            "props": shared_buffer.prop_tensor,
-            "size": shared_buffer.size.value
-        }
-        torch.save(data, SAVE_PATH+"training_data.pt")
         stop_event.set()
         for p in processes:
             p.join()
