@@ -200,14 +200,16 @@ class GameState():
         result = jit_embed_board(self.board, self.wins, self.nowallowed, self.crossNowPlaying)
         return torch.from_numpy(result)
 
-    def visualize_board(self):
+    def visualize_board(self, show_A=True):
         symbols = {0: '.', 1: 'X', 2: 'O'}
+        print("   A B C   D E F   G H I")
+        print("  " + "—" * 25)
         embeded = self.embed_board()
         for y in range(9):
-            row = ""
+            row = f"{y + 1} |"
             for x in range(9):
                 idx = y*9 + x
-                row += (symbols[self.board[idx]] if self.board[idx]!=0 else ('A' if embeded[2][y][x]==1 else symbols[0])) + " "
+                row += (symbols[self.board[idx]] if self.board[idx]!=0 else ('A' if embeded[2][y][x]==1 and show_A else symbols[0])) + " "
                 assert self.board[idx]==0 or not embeded[2][y][x]==1, "Field is both avaliable and used"
                 assert embeded[2][y][x] == 0 or self.wins[(y//3) * 3 + (x//3)] == -2, "Field avaliable when subboard solved"
                 if x % 3 == 2 and x != 8:
@@ -397,7 +399,7 @@ def jit_get_possible_moves(nowallowed:int, wins: np.ndarray, board:np.ndarray) -
 class MCTSTickTacToe(MCTSForestParticipant[GameState, int]):
     def __init__(self, model: nn.Module, device: torch.device, forest: MCTSForest[GameState, int] | None = None,
                  start_state: GameState | None = None, history_size: int = 1, cpuct: float = 1,
-                 training_mode: bool = False, epsilon: float = 0, training_data_temp: float = 1.0, posteval_temp: float = 1.0):
+                 training_mode: bool = False, epsilon: float = 0, training_data_temp: float = 1.0, posteval_temp: float = 1.0, no_eval_mode: bool = False):
         self.model, self.device = model, device
         self.forest = forest
         self.pathSave: list[list[tuple[int, int]]] = []
@@ -406,6 +408,7 @@ class MCTSTickTacToe(MCTSForestParticipant[GameState, int]):
         if start_state is None:
             start_state = GameState(True, -1, np.zeros(81, dtype=np.int8), np.full(9, -2), False)
         self.posteval_temp = posteval_temp
+        self.no_eval_mode = no_eval_mode
         super().__init__(start_state=start_state, history_size=history_size, cpuct=cpuct, training_mode=training_mode, epsilon=epsilon, training_data_temp=training_data_temp)
 
     def _apply_move(self, gameState: GameState, move: int) -> GameState:
@@ -441,6 +444,8 @@ class MCTSTickTacToe(MCTSForestParticipant[GameState, int]):
         return jit_get_possible_moves(gameState.nowallowed, gameState.wins, gameState.board).tolist()
 
     def evaluate(self, node: int, path_from_root: list[tuple[int, int]]):
+        if self.no_eval_mode:
+            return
         currentNode = self.transpositionTable[node]
         winsScore = self._score_game(currentNode.gameState.wins)
         if winsScore != -2:
@@ -465,8 +470,8 @@ class MCTSTickTacToe(MCTSForestParticipant[GameState, int]):
         value = v.item()
         movemask = input[2].reshape(81)
         currentNode.eval = value
-        currentNode.possibleMovesPropabilityDist = F.softmax(prop[movemask == 1]/self.posteval_temp,
-                                                             dim=0).cpu().numpy().tolist()
+        currentNode.possibleMovesPropabilityDist = torch.clamp(F.softmax(prop[movemask == 1]/self.posteval_temp,
+                                                             dim=0),0.001,1).cpu().numpy().tolist()
         self._backprop(self.pathSave[id], value)
         self.pathSave.pop(id)
         self.currentNode.pop(id)
